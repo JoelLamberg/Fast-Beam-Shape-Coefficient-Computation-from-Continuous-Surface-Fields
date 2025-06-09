@@ -3,9 +3,9 @@ clear all
 ticIDTOT=tic;
 lambda=1e-3;    %% Wavelength
 a=0.003;        %% Radius of Sphere
-N=100;           %% Number of Modes
+N=140;           %% Number of Modes
 nz=200;ny=nz;   %% Plot accuracy
-mr=sqrt(1);     %% Refractive Index Real and Imiganary Part
+mr=sqrt(1.85);     %% Refractive Index Real and Imiganary Part
 k=2*pi/lambda;ka = k*a;
 %% Pre-allocate matrxes
 Ex_inc=zeros(nz);Ey_inc=zeros(nz);Ez_inc=zeros(nz);
@@ -13,75 +13,77 @@ Ex_scat=zeros(nz);Ey_scat=zeros(nz);Ez_scat=zeros(nz);
 Er_inc=zeros(nz);Etheta_inc=zeros(nz);Ephi_inc=zeros(nz);
 Er_scat=zeros(nz);Etheta_scat=zeros(nz);Ephi_scat=zeros(nz);
 %% Cylindrical vector beam parameters
-load('CVB_azimuthal_804.mat')
-dOmega = 0.000117779/length(Xeva);
-Xsource=Xeva;Ysource=Yeva;Zsource=Zeva;
+load('AxiconParameters2025New.mat')
+dOmega = 0.000117779/length(1800);
+Xsource=x;Ysource=y;Zsource=z;
 %% Unit sphere integration using Fibonacci distribution
 fib=((2*N)^2)*4;fac=(k/(2*pi))^2;
 dS = 4*pi/fib; goldenRatio = (1 + 5^0.5)/2;
 d=0;
 ticID = tic;
-validInds = [];  % Collect valid indices
-for ind = 0:fib
-    PH = acos(1 - 2*(ind + 0.5)/fib);
-    if abs(PH) < pi
-        validInds(end + 1) = ind; %#ok<AGROW>
-    end
-end
+Teta_temp  = nan(1, fib+1);
+Phi_temp   = nan(1, fib+1);
+Gamma_temp = nan(1, fib+1);
+Beta_temp  = nan(1, fib+1);
 
-d = numel(validInds);  % Final value of d after the loop
-
-% Preallocate output arrays
-Teta = zeros(1, d);
-Phi = zeros(1, d);
-Gamma = zeros(1, d);
-Beta = zeros(1, d);
-
-% Parallel computation
-parfor i = 1:d
-    ind = validInds(i);
+parfor ind = 0:fib
 
     TE = 2 * pi * ind / goldenRatio;
     PH = acos(1 - 2 * (ind + 0.5) / fib);
 
-    Xt = a * cos(TE) * sin(PH);
-    Yt = a * sin(TE) * sin(PH);
-    Zt = a * cos(PH);
+    if abs(PH) < pi
 
-    Phi1 = atan2(Yt, Xt);
-    theta1 = atan2(sqrt(Xt^2 + Yt^2), Zt);
-    Teta(i) = theta1;
-    Phi(i) = Phi1;
+        Xt = a * cos(TE) * sin(PH);
+        Yt = a * sin(TE) * sin(PH);
+        Zt = a * cos(PH);
 
-    S = [sin(theta1) * cos(Phi1), sin(theta1) * sin(Phi1), cos(theta1)];
-    e_theta = [cos(theta1) * cos(Phi1), cos(theta1) * sin(Phi1), -sin(theta1)];
-    e_phi = [-sin(Phi1), cos(Phi1), 0];
+        Phi1 = atan2(Yt, Xt);
+        theta1 = atan2(sqrt(Xt^2 + Yt^2), Zt);
 
-    Sthetaphi = [0 0 0];
-    kx = k * sin(theta1) * cos(Phi1);
-    ky = k * sin(theta1) * sin(Phi1);
-    kz = k * cos(theta1);
+        S = [sin(theta1) * cos(Phi1), sin(theta1) * sin(Phi1), cos(theta1)];
+        e_theta = [cos(theta1) * cos(Phi1), cos(theta1) * sin(Phi1), -sin(theta1)];
+        e_phi = [-sin(Phi1), cos(Phi1), 0];
 
-    for index = 1:length(Xsource)
-        Ox = Xsource(index);
-        Oy = Ysource(index)-0.75*a;
-        Oz = Zsource(index);
-        gb = -[Ox Oy Oz];
+        kx = k * sin(theta1) * cos(Phi1);
+        ky = k * sin(theta1) * sin(Phi1);
+        kz = k * cos(theta1);
 
-        e1 = e_1(index, :);
-        e2 = e_2(index, :);
-        e3 = e_3(index, :);
+        Sthetaphi = [0, 0, 0];
 
-        if dot(S, e3) > 0
-            Sthetaphi = Sthetaphi + E_0(index) * shiftGB(gb, kx, ky, kz) ...
-                .* (e1 - (dot(e1, S) / dot(e3, S)) * e3) * dot(e3, S) * dOmega;
+        for index = 1:length(Xsource)
+
+            Ox = Xsource(index);
+            Oy = Ysource(index) - a * 0.75;
+            Oz = Zsource(index) - 0.015;
+
+            e1 = e_1(index,:);
+            e2 = e_2(index,:);
+            e3 = e_3(index,:);
+            gb = -[Ox Oy Oz];
+
+            if dot(S, e3) > 0
+                shft = GB(index) * shiftGB(gb, kx, ky, kz) ...
+                     .* (e1 - (dot(e1, S) / dot(e3, S)) * e3) ...
+                     * dot(e3, S) * dOmega;
+                Sthetaphi = Sthetaphi + shft;
+            end
         end
-    end
 
-    Gamma(i) = dot(Sthetaphi, e_theta) * dS;
-    Beta(i) = dot(Sthetaphi, e_phi) * dS;
+        Teta_temp(ind+1)  = theta1;
+        Phi_temp(ind+1)   = Phi1;
+        Gamma_temp(ind+1) = dot(Sthetaphi, e_theta) * dS;
+        Beta_temp(ind+1)  = dot(Sthetaphi, e_phi) * dS;
+    end
 end
 
+% Remove NaNs (i.e., points that failed abs(PH) < pi)
+valid = ~isnan(Teta_temp);
+
+Teta  = Teta_temp(valid);
+Phi   = Phi_temp(valid);
+Gamma = Gamma_temp(valid);
+Beta  = Beta_temp(valid);
+d = sum(valid);
 elapsed = toc(ticID)
 %% Incident Co
 ticID1 = tic;
@@ -201,14 +203,15 @@ GtoMN=BtoMN.*T33;
 %% Field
 % toc
 % tic
+
 ticID3=tic;
 ys=zeros(1,ny);zs=zeros(1,nz);
-dy=8/(ny-1);dz=8/(nz-1);Xt=0;
-ys=linspace(-4.75,3.25,ny);zs=linspace(-4,4,nz);
+dy=36/(ny-1);dz=36/(nz-1);Xt=0;
+ys=linspace(-18.75,17.25,ny);zs=linspace(-18,18,nz);
 parfor iy=1:ny
-      Yt=-4.75+dy*(iy-1);
+      Yt=-18.75+dy*(iy-1);
     for iz=1:nz  
-       Zt=-4+dz*(iz-1);
+       Zt=-18+dz*(iz-1);
        ryz=sqrt(Xt^2+Yt^2+Zt^2);
        xi=ka*ryz;
        % Local coordinate angles at the evaluating point
@@ -367,19 +370,19 @@ elapsedTOT = toc(ticIDTOT)
 [Y,Z] = meshgrid(zs,ys);
 %%
 
-filename = 'CVB_Azimuthal_XZ_mr1.mat';
+filename = 'Axicon_XZ_May_mr1_85.mat';
 save(filename,'Y','Z','Ex_inc','Ey_inc','Ez_inc',...
     'Ex_scat','Ey_scat','Ez_scat','Er_inc','Etheta_inc','Ephi_inc',...
     'Er_scat','Etheta_scat','Ephi_scat')
 
-%%
+
 E_total1 = sqrt(abs(Ex_inc+Ex_scat).^2 + abs(Ey_inc+Ey_scat).^2 + abs(Ez_inc+Ez_scat).^2);
 Enorm=max(max(E_total1));
 [Y,Z] = meshgrid(zs,ys);
 
 figure,
-surf(Y,Z,(E_total1./Enorm));view(0,90)
-axis equal;axis tight;colormap jet
+surf(Y,Z,(E_total1./Enorm));view(0,90);colormap jet;
+axis equal;axis tight
 xlabel('y/a')
 ylabel('z/a')
 shading interp
