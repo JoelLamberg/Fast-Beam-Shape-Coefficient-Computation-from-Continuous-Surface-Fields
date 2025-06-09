@@ -1,0 +1,386 @@
+clc
+clear all
+ticIDTOT=tic;
+lambda=1e-3;    %% Wavelength
+a=0.003;        %% Radius of Sphere
+N=100;           %% Number of Modes
+nz=200;ny=nz;   %% Plot accuracy
+mr=sqrt(1);     %% Refractive Index Real and Imiganary Part
+k=2*pi/lambda;ka = k*a;
+%% Pre-allocate matrxes
+Ex_inc=zeros(nz);Ey_inc=zeros(nz);Ez_inc=zeros(nz);
+Ex_scat=zeros(nz);Ey_scat=zeros(nz);Ez_scat=zeros(nz);
+Er_inc=zeros(nz);Etheta_inc=zeros(nz);Ephi_inc=zeros(nz);
+Er_scat=zeros(nz);Etheta_scat=zeros(nz);Ephi_scat=zeros(nz);
+%% Cylindrical vector beam parameters
+load('CVB_azimuthal_804.mat')
+dOmega = 0.000117779/length(Xeva);
+Xsource=Xeva;Ysource=Yeva;Zsource=Zeva;
+%% Unit sphere integration using Fibonacci distribution
+fib=((2*N)^2)*4;fac=(k/(2*pi))^2;
+dS = 4*pi/fib; goldenRatio = (1 + 5^0.5)/2;
+d=0;
+ticID = tic;
+validInds = [];  % Collect valid indices
+for ind = 0:fib
+    PH = acos(1 - 2*(ind + 0.5)/fib);
+    if abs(PH) < pi
+        validInds(end + 1) = ind; %#ok<AGROW>
+    end
+end
+
+d = numel(validInds);  % Final value of d after the loop
+
+% Preallocate output arrays
+Teta = zeros(1, d);
+Phi = zeros(1, d);
+Gamma = zeros(1, d);
+Beta = zeros(1, d);
+
+% Parallel computation
+parfor i = 1:d
+    ind = validInds(i);
+
+    TE = 2 * pi * ind / goldenRatio;
+    PH = acos(1 - 2 * (ind + 0.5) / fib);
+
+    Xt = a * cos(TE) * sin(PH);
+    Yt = a * sin(TE) * sin(PH);
+    Zt = a * cos(PH);
+
+    Phi1 = atan2(Yt, Xt);
+    theta1 = atan2(sqrt(Xt^2 + Yt^2), Zt);
+    Teta(i) = theta1;
+    Phi(i) = Phi1;
+
+    S = [sin(theta1) * cos(Phi1), sin(theta1) * sin(Phi1), cos(theta1)];
+    e_theta = [cos(theta1) * cos(Phi1), cos(theta1) * sin(Phi1), -sin(theta1)];
+    e_phi = [-sin(Phi1), cos(Phi1), 0];
+
+    Sthetaphi = [0 0 0];
+    kx = k * sin(theta1) * cos(Phi1);
+    ky = k * sin(theta1) * sin(Phi1);
+    kz = k * cos(theta1);
+
+    for index = 1:length(Xsource)
+        Ox = Xsource(index);
+        Oy = Ysource(index)-0.75*a;
+        Oz = Zsource(index);
+        gb = -[Ox Oy Oz];
+
+        e1 = e_1(index, :);
+        e2 = e_2(index, :);
+        e3 = e_3(index, :);
+
+        if dot(S, e3) > 0
+            Sthetaphi = Sthetaphi + E_0(index) * shiftGB(gb, kx, ky, kz) ...
+                .* (e1 - (dot(e1, S) / dot(e3, S)) * e3) * dot(e3, S) * dOmega;
+        end
+    end
+
+    Gamma(i) = dot(Sthetaphi, e_theta) * dS;
+    Beta(i) = dot(Sthetaphi, e_phi) * dS;
+end
+
+elapsed = toc(ticID)
+%% Incident Co
+ticID1 = tic;
+nm=1;
+parfor m = 0:N-1
+    local_nm = 1;
+    inst = max(m,1);
+    Atemnj = zeros(1,N); Atomnj = zeros(1,N); Btemnj = zeros(1,N); Btomnj = zeros(1,N);
+    
+    for j = 1:d
+        tetaj = Teta(j); phij = Phi(j);
+        sinphi = sin(phij); cosphi = cos(phij);
+        sinmph1 = sin(m*phij); cosmphi1 = cos(m*phij); cost = cos(tetaj);
+        Gammaj = Gamma(j); Betaj = Beta(j);
+
+        tempdd = PIETAOAll(N+1,m,tetaj);
+        PIE = tempdd(1,:);
+        TAO = tempdd(2,:);
+        
+        for n = inst:N
+            sn = n + 1;
+            Atemn = (Gammaj*m*sinmph1*PIE(sn) + Betaj*cosmphi1*TAO(sn)); Atemnj(n) = Atemnj(n) + Atemn;
+            Atomn = (Gammaj*m*cosmphi1*PIE(sn) - Betaj*sinmph1*TAO(sn)); Atomnj(n) = Atomnj(n) + Atomn;
+            Btemn = (Gammaj*cosmphi1*TAO(sn) - Betaj*sinmph1*m*PIE(sn)); Btemnj(n) = Btemnj(n) + Btemn;
+            Btomn = (Gammaj*sinmph1*TAO(sn) + Betaj*cosmphi1*m*PIE(sn)); Btomnj(n) = Btomnj(n) + Btomn;
+        end
+    end
+    
+    num_terms = N - inst + 1;
+    AteMN_local = zeros(1,num_terms);
+    AtoMN_local = zeros(1,num_terms);
+    BteMN_local = zeros(1,num_terms);
+    BtoMN_local = zeros(1,num_terms);
+    Nc_local = zeros(1,num_terms);
+    Mc_local = zeros(1,num_terms);
+    
+    idx = 1;
+    for n = inst:N
+        AteMN_local(idx) = -4*1i^n * fac * Atemnj(n);
+        AtoMN_local(idx) =  4*1i^n * fac * Atomnj(n);
+        BteMN_local(idx) = -4*1i^(n+1) * fac * Btemnj(n);
+        BtoMN_local(idx) = -4*1i^(n+1) * fac * Btomnj(n);
+        Nc_local(idx) = n;
+        Mc_local(idx) = m;
+        idx = idx + 1;
+    end
+
+    AteMN_cell{m+1} = AteMN_local;
+    AtoMN_cell{m+1} = AtoMN_local;
+    BteMN_cell{m+1} = BteMN_local;
+    BtoMN_cell{m+1} = BtoMN_local;
+    Nc_cell{m+1} = Nc_local;
+    Mc_cell{m+1} = Mc_local;
+end
+
+% Concatenate after loop
+AteMN = [AteMN_cell{:}];
+AtoMN = [AtoMN_cell{:}];
+BteMN = [BteMN_cell{:}];
+BtoMN = [BtoMN_cell{:}];
+Nc = [Nc_cell{:}];
+Mc = [Mc_cell{:}];
+% Code block 1
+elapsed1 = toc(ticID1)
+%% Internal Co
+ticID2 = tic;
+xc=k*a;mxc=mr*k*a;
+sqxc= sqrt(0.5*pi/xc);           sqmxc= sqrt(0.5*pi/mxc);
+jx=besselj(Nc+0.5,xc).*sqxc;     jxM1=besselj(Nc-0.5,xc).*sqxc;
+jmx=besselj(Nc+0.5,mxc).*sqmxc;  jmxM1=besselj(Nc-0.5,mxc).*sqmxc;
+hx=besselh(Nc+0.5,xc).*sqxc;     hxM1=besselh(Nc-0.5,xc).*sqxc;
+Drjm=mxc.*jmxM1-Nc.*jmx;
+Drh=xc.*hxM1-Nc.*hx;
+Drj=xc.*jxM1-Nc.*jx;
+kf=1;
+for km=0:N-1
+    if km==0
+        inst=1;
+    else
+        inst=km;
+    end
+    for kn=inst:N
+        if km==0
+            f1=4*kn*(kn+1)/(2*kn+1);
+            f2=0;
+        else
+            f1=10^(-km)*2*kn*(kn+1)/(2*kn+1)*factorial(kn+km)/factorial(kn-km);
+            f2= f1;
+        end
+        A11(1,kf)= f1*(k*a)^2*hx(kn)*jmx(kn)*(mr*jmxM1(kn)/jmx(kn)-hxM1(kn)/hx(kn));
+        A22(1,kf)=f2*(k*a)^2*hx(kn)*jmx(kn)*(mr*jmxM1(kn)/jmx(kn)-hxM1(kn)/hx(kn));
+        A33(1,kf)= f1*(k*a)*hx(kn)*jmx(kn)*(k*a*(jmxM1(kn)/jmx(kn)-mr*hxM1(kn)/hx(kn))+(mr^2-1)*kn/mr);
+        A44(1,kf)= f2*(k*a)*hx(kn)*jmx(kn)*(k*a*(jmxM1(kn)/jmx(kn)-mr*hxM1(kn)/hx(kn))+(mr^2-1)*kn/mr);
+        kf=kf+1;
+    end
+end
+CteMN=-1i./A11.*AteMN;
+CtoMN=-1i./A22.*AtoMN;
+DteMN=-1i./A33.*BteMN;
+DtoMN=-1i./A44.*BtoMN;
+CteMN(isnan(CteMN))=0;
+CtoMN(isnan(CtoMN))=0;
+DteMN(isnan(DteMN))=0;
+DtoMN(isnan(DtoMN))=0;% Code block 1
+elapsed2 = toc(ticID2)
+%% Scattering Co
+Pn=mr.*jx.*jmxM1-jxM1.*jmx;
+Qn=mr.*hx.*jmxM1-hxM1.*jmx;
+Rn=-jx.*(mr*k*a.*jmxM1+(mr^2-1).*Nc.*jmx)+mr^2.*k*a*jmx.*jxM1;
+Sn=hx.*(mr*k*a.*jmxM1+(mr^2-1).*Nc.*jmx)-mr^2.*k*a*jmx.*hxM1;
+T11=Pn./Qn;
+T33=Rn./Sn;
+FteMN=-AteMN.*T11;
+FtoMN=-AtoMN.*T11;
+GteMN=BteMN.*T33;
+GtoMN=BtoMN.*T33;
+%% Field
+% toc
+% tic
+ticID3=tic;
+ys=zeros(1,ny);zs=zeros(1,nz);
+dy=8/(ny-1);dz=8/(nz-1);Xt=0;
+ys=linspace(-4.75,3.25,ny);zs=linspace(-4,4,nz);
+parfor iy=1:ny
+      Yt=-4.75+dy*(iy-1);
+    for iz=1:nz  
+       Zt=-4+dz*(iz-1);
+       ryz=sqrt(Xt^2+Yt^2+Zt^2);
+       xi=ka*ryz;
+       % Local coordinate angles at the evaluating point
+        Phi=atan2(Yt,Xt);Teta=atan2(sqrt(Xt^2+Yt^2),Zt);
+        
+        % Local spherical to Cartesian transformation matrix
+        Omega = [sin(Teta)*cos(Phi),cos(Teta)*cos(Phi),-sin(Phi);
+        sin(Teta)*sin(Phi),cos(Teta)*sin(Phi),cos(Phi);
+        cos(Teta),-sin(Teta),0];  
+        if ryz>1  
+            sqxi= sqrt(0.5*pi/xi);
+            Hj=0;HjM1=0;Hjkr=0;DRHj=0;Bj=0;Bjm1=0;Bjkr=0;DRBj=0;
+            for nh=1:N
+                    Hj(nh)=besselh(nh+0.5,xi)*sqxi;
+                    HjM1=besselh(nh-0.5,xi)*sqxi;
+                    Hjkr(nh)=Hj(nh)/xi;
+                    DRHj(nh)=HjM1-nh*Hjkr(nh);
+                    Bj(nh)=besselj(nh+0.5,xi)*sqxi;
+                    BjM1=besselj(nh-0.5,xi).*sqxi;
+                    Bjkr(nh)=Bj(nh)/xi;
+                    DRBj(nh)=BjM1-nh*Bjkr(nh);
+            end
+            Et_R_inc=0;Et_teta_inc=0;Et_phi_inc=0;
+            Et_R_scat=0;Et_teta_scat=0;Et_phi_scat=0;
+            snm=1;
+            for  m=0:N-1
+                if m==0
+                    inst=1; 
+
+                else
+                    inst=m; 
+                end
+                temp2=PIETAOAll(N+1,m,Teta);
+                PIEmn=temp2(1,:);
+                TAOmn=temp2(2,:);
+                fda=10^(-m);
+                sinmph1=sin(m*Phi);cosmphi1=cos(m*Phi);sint1=sin(Teta);
+                for n=inst:N
+                    sn=n+1;
+                    %Dmn=((emn)*(2*n+1)*factorial(n-m)/((4*n)*(n+1)*factorial(n+m)));
+                    Dmn=fact(m,n);
+                    
+                    MEmnteta1=-Bj(n)*sinmph1*m*PIEmn(sn);
+                    MEmnphi1=-Bj(n)*cosmphi1*TAOmn(sn);
+                    MOmnteta1=Bj(n)*cosmphi1*m*PIEmn(sn);
+                    MOmnphi1=-Bj(n)*sinmph1*TAOmn(sn);
+                    NEmnR1=n*(n+1)*Bjkr(n)*cosmphi1*PIEmn(sn)*sint1;
+                    NEmnteta1=DRBj(n)*cosmphi1*TAOmn(sn);
+                    NEmnphi1=-DRBj(n)*sinmph1*m*PIEmn(sn);
+                    NOmnR1=n*(n+1)*Bjkr(n)*sinmph1*PIEmn(sn)*sint1;
+                    NOmnteta1=DRBj(n)*sinmph1*TAOmn(sn);
+                    NOmnphi1=DRBj(n)*cosmphi1*m*PIEmn(sn);                   
+                    %% scatter
+     
+                    MEmnteta3=-Hj(n)*sinmph1*m*PIEmn(sn);
+                    MEmnphi3=-Hj(n)*cosmphi1*TAOmn(sn); 
+                    MOmnteta3=Hj(n)*cosmphi1*m*PIEmn(sn);
+                    MOmnphi3=-Hj(n)*sinmph1*TAOmn(sn);                    
+                    NEmnR3=n*(n+1)*Hjkr(n)*cosmphi1*PIEmn(sn)*sint1;
+                    NEmnteta3=DRHj(n)*cosmphi1*TAOmn(sn);
+                    NEmnphi3=-DRHj(n)*sinmph1*m*PIEmn(sn);                    
+                    NOmnR3=n*(n+1)*Hjkr(n)*sinmph1*PIEmn(sn)*sint1;
+                    NOmnteta3=DRHj(n)*sinmph1*TAOmn(sn);
+                    NOmnphi3=DRHj(n)*cosmphi1*m*PIEmn(sn);
+                    
+                    %% save the incident and scattered spherical field components
+                    Et_R_inc=Et_R_inc+(Dmn/fda)*(BteMN(snm)*NEmnR1+BtoMN(snm)*NOmnR1)/fda;
+                    Et_R_scat=Et_R_scat+(Dmn/fda)*(GteMN(snm)*NEmnR3+GtoMN(snm)*NOmnR3)/fda;
+            
+                    Et_teta_inc=Et_teta_inc+(Dmn/fda)*(AteMN(snm)*MEmnteta1+AtoMN(snm)*MOmnteta1+BteMN(snm)*NEmnteta1+BtoMN(snm)*NOmnteta1)/fda;
+                    Et_teta_scat=Et_teta_scat+(Dmn/fda)*(FteMN(snm)*MEmnteta3+FtoMN(snm)*MOmnteta3+GteMN(snm)*NEmnteta3+GtoMN(snm)*NOmnteta3)/fda;
+                    
+                    Et_phi_inc= Et_phi_inc+(Dmn/fda)*(AteMN(snm)*MEmnphi1+AtoMN(snm)*MOmnphi1+BteMN(snm)*NEmnphi1+BtoMN(snm)*NOmnphi1)/fda;
+                    Et_phi_scat= Et_phi_scat+(Dmn/fda)*(FteMN(snm)*MEmnphi3+FtoMN(snm)*MOmnphi3+GteMN(snm)*NEmnphi3+GtoMN(snm)*NOmnphi3)/fda;
+                    snm=snm+1;
+                end
+            end
+            E_INC = Omega * [Et_R_inc;Et_teta_inc;Et_phi_inc];
+            E_SCAT = Omega * [Et_R_scat;Et_teta_scat;Et_phi_scat];
+            
+            Ex_inc(iz,iy)=E_INC(1);
+            Ey_inc(iz,iy)=E_INC(2);
+            Ez_inc(iz,iy)=E_INC(3);
+    
+            Ex_scat(iz,iy)=E_SCAT(1);
+            Ey_scat(iz,iy)=E_SCAT(2);
+            Ez_scat(iz,iy)=E_SCAT(3);
+    
+            Er_inc(iz,iy)=Et_R_inc;
+            Etheta_inc(iz,iy)=Et_teta_inc;
+            Ephi_inc(iz,iy)=Et_phi_inc;
+    
+            Er_scat(iz,iy)=Et_R_scat;
+            Etheta_scat(iz,iy)=Et_teta_scat;
+            Ephi_scat(iz,iy)=Et_phi_scat;
+
+        elseif ryz<1 
+                        
+            zi=mr*xi;            
+            sqzi= sqrt(0.5*pi/zi);
+            Bjz=0;BjzM1=0;Bjkrz=0;DRBjz=0;
+            for nb=1:N
+            Bjz(nb)=besselj(nb+0.5,zi)*sqzi;
+            BjzM1=besselj(nb-0.5,zi)*sqzi;
+            Bjkrz(nb)=Bjz(nb)/zi;
+            DRBjz(nb)=BjzM1-nb*Bjkrz(nb);
+            end
+            Et_R1=0;Et_teta1=0;Et_phi1=0;
+            snm1=1;
+            for  m=0:N-1
+                if m==0
+                    inst=1;
+                else
+                    inst=m;
+                end
+                temp1=PIETAOAll(N+1,m,Teta);
+                PIEmni=temp1(1,:);
+                TAOmni=temp1(2,:);
+                fda=10^(-m);
+                sinmphi=sin(m*Phi);cosmphii=cos(m*Phi);sinti=sin(Teta);
+                for n=inst:N
+                    sn=n+1;
+                    
+                    MEmnphi2=-cosmphii*Bjz(n)*TAOmni(sn);
+                    MEmnteta2=-sinmphi*Bjz(n)*m*PIEmni(sn); 
+                    MOmnphi2=-sinmphi*Bjz(n)*TAOmni(sn);
+                    MOmnteta2=cosmphii*Bjz(n)*m*PIEmni(sn);
+                    NEmnR2=cosmphii*Bjkrz(n)*n*(n+1)*sinti*PIEmni(sn);
+                    NEmnphi2=-sinmphi*DRBjz(n)*m*PIEmni(sn);
+                    NEmnteta2=cosmphii*DRBjz(n)*TAOmni(sn);
+                    NOmnR2=sinmphi*Bjkrz(n)*n*(n+1)*sinti*PIEmni(sn);
+                    NOmnphi2=cosmphii*DRBjz(n)*m*PIEmni(sn);
+                    NOmnteta2=sinmphi*DRBjz(n)*TAOmni(sn);
+                    
+                    Et_R1=Et_R1+(DteMN(snm1)*NEmnR2+DtoMN(snm1)*NOmnR2)/fda;
+                    Et_teta1= Et_teta1+(CteMN(snm1)*MEmnteta2+CtoMN(snm1)*MOmnteta2+DteMN(snm1)*NEmnteta2+DtoMN(snm1)*NOmnteta2)/fda;
+                    Et_phi1=Et_phi1+(CteMN(snm1)*MEmnphi2+CtoMN(snm1)*MOmnphi2+DteMN(snm1)*NEmnphi2+DtoMN(snm1)*NOmnphi2)/fda;
+                    snm1=snm1+1;
+                end
+            end
+            E_INC = Omega * [Et_R1;Et_teta1;Et_phi1];
+    
+            
+            Ex_inc(iz,iy)=E_INC(1);
+            Ey_inc(iz,iy)=E_INC(2);
+            Ez_inc(iz,iy)=E_INC(3);
+    
+            Er_inc(iz,iy)=Et_R1;
+            Etheta_inc(iz,iy)=Et_teta1;
+            Ephi_inc(iz,iy)=Et_phi1;         
+        end       
+    end
+end
+elapsed3 = toc(ticID3)
+elapsedTOT = toc(ticIDTOT)
+[Y,Z] = meshgrid(zs,ys);
+%%
+
+filename = 'CVB_Azimuthal_XZ_mr1.mat';
+save(filename,'Y','Z','Ex_inc','Ey_inc','Ez_inc',...
+    'Ex_scat','Ey_scat','Ez_scat','Er_inc','Etheta_inc','Ephi_inc',...
+    'Er_scat','Etheta_scat','Ephi_scat')
+
+%%
+E_total1 = sqrt(abs(Ex_inc+Ex_scat).^2 + abs(Ey_inc+Ey_scat).^2 + abs(Ez_inc+Ez_scat).^2);
+Enorm=max(max(E_total1));
+[Y,Z] = meshgrid(zs,ys);
+
+figure,
+surf(Y,Z,(E_total1./Enorm));view(0,90)
+axis equal;axis tight;colormap jet
+xlabel('y/a')
+ylabel('z/a')
+shading interp
+hold on
