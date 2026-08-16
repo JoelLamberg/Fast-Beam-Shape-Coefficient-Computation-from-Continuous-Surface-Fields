@@ -1,0 +1,446 @@
+function out = mieFromSurfaceField(surf, opt)
+%MIEFROMSURFACEFIELD Fast, overflow-safe rewrite of the Optics Letters method
+% "Fast beam shape coefficient computation from continuous surface fields"
+% (J. Lamberg, L. Lamberg, Z. Taylor, Opt. Lett. 50, 4554 (2025)).
+%
+% Given a tangential ELECTRIC field defined on a compact surface, this
+% computes its beam shape coefficients (BSCs), then the incident, scattered
+% and internal fields for a homogeneous Mie sphere -- in one continuous
+% surface integral plus one vector spherical harmonic (VSH) expansion.
+%
+% out = MIEFROMSURFACEFIELD(surf, opt)
+%
+% INPUT surf (struct, the source surface Omega):
+% .O [Ns x 3] source points in GLOBAL coords, relative to sphere centre
+% .e1 [Ns x 3] local basis vector 1 (electric-field / polarization dir)
+% .e3 [Ns x 3] local basis vector 3 (propagation / outward normal dir)
+% .E0 [Ns x 1] complex source amplitude along e1 at each point
+% .dA [Ns x 1] surface-area element per point (scalar also accepted)
+% -> NOTE: this replaces the original's buggy
+% dOmega = const/length(1800); use real per-point areas.
+%
+% INPUT opt (struct, parameters):
+% .k wavenumber (2*pi/lambda)
+% .N number of modes
+% .a sphere radius
+% .mr relative refractive index of sphere (mr = 1 -> no scatterer)
+% .Reval [P x 3] evaluation points (GLOBAL, relative to sphere centre).
+% Optional; if omitted only BSCs/coeffs are returned.
+% .nTheta theta nodes for the direction quadrature (default 2N+4)
+% .nPhi phi nodes (must be > 2N to resolve all m; default 2N+8)
+% .verbose print timing (default false)
+% .useParallel run the Stage-5 field evaluation on a parpool via parfor
+% (default false). Requires the Parallel Computing Toolbox;
+% degrades gracefully to serial when it is absent or false.
+%
+% OUTPUT out (struct):
+% .Ate,.Ato,.Bte,.Bto [Nc x 1] incident BSCs (M=A/TE, N=B/TM; e/o parity)
+% .Fte,.Fto,.Gte,.Gto [Nc x 1] scattered BSCs (= -A.*b_n , -B.*a_n)
+% .Cte,.Cto,.Dte,.Dto [Nc x 1] internal BSCs (= A.*c_n , B.*d_n)
+% .m,.n [Nc x 1] mode indices for each coefficient
+% .an,.bn,.cn,.dn [N x 1] Mie sphere coefficients
+% .Einc,.Escat,.Eint [P x 3] fields at Reval (if Reval given)
+% .Etot [P x 3] Einc+Escat outside, Eint inside
+%
+% METHOD / VALIDATION
+% The whole chain (angular spectrum Eq.10-11, BSCs Eq.14-15, VSH Eq.16) is
+% reproduced here in a FULLY-NORMALIZED associated-Legendre convention so
+% that no factorial / 10^(-m) bookkeeping is needed and high N is stable.
+% Equivalence to the original convention and to the direct angular-spectrum
+% integral was checked to ~1e-15 (see test_planewave_mie.m); the Mie
+% coefficients reproduce textbook a_n,b_n with exact energy conservation.
+%
+% SPEED
+% - direction integral uses a structured Gauss-Legendre(theta) x uniform(phi)
+% grid (~2N^2 nodes) instead of ~16N^2 Fibonacci nodes;
+% - the phi-integral is done by FFT (all m at once);
+% - the surface sum is vectorized (chunked) over source points.
+% This turns the dominant BSC stage from O(N^4) into ~O(N^3).
+%
+% See also: NORMLEGENDREPITAU, SPHBESSEL, MIESPHERECOEFFS (local functions).
+% ----------------------------- options / defaults -------------------------
+k = opt.k; N = opt.N; a = opt.a; mr = opt.mr;
+if ~isfield(opt,'nTheta') || isempty(opt.nTheta), opt.nTheta = 2*N+4; end
+if ~isfield(opt,'nPhi') || isempty(opt.nPhi), opt.nPhi = 2*N+8; end
+if ~isfield(opt,'verbose'), opt.verbose = false; end
+if ~isfield(opt,'useParallel'), opt.useParallel = false; end
+nTheta = opt.nTheta; nPhi = opt.nPhi;
+assert(nPhi > 2*N, 'nPhi must exceed 2N to resolve all azimuthal orders m.');
+% ---- optional parallelism (Parallel Computing Toolbox) -------------------
+% Only STAGE 5 (field evaluation) is parallelized -- it is the dominant cost for
+% large evaluation grids and its chunks are independent. Stages 1-2 are left
+% serial: their work is already multithreaded BLAS, which parfor's
+% single-threaded workers would only give up. The Stage-5 loop is written
+% parfor (jc = 1:nCh, maxW): maxW = 0 runs serially on the client (also the
+% automatic behaviour when the toolbox is absent); maxW = #workers distributes.
+maxW = 0;
+if opt.useParallel
+if ~isempty(ver('parallel'))
+pp = gcp('nocreate'); if isempty(pp), pp = parpool; end
+maxW = pp.NumWorkers;
+if opt.verbose, fprintf('Parallel: %d workers.\n', maxW); end
+else
+warning('mieFromSurfaceField:noParallelToolbox', ...
+'opt.useParallel=true but Parallel Computing Toolbox not found; running serially.');
+end
+end
+O = surf.O; e1 = surf.e1; e3 = surf.e3; E0 = surf.E0(:);
+Ns = size(O,1);
+dA = surf.dA; if isscalar(dA), dA = dA*ones(Ns,1); else, dA = dA(:); end
+w = E0 .* dA; % complex per-source weight (Ns x 1)
+% =========================================================================
+% STAGE 1 -- continuous angular spectrum e0(theta,phi) = gamma*e_theta+beta*e_phi
+% e0(s) = sum_o w(o) e^{-i k s.o} [ e1 - (e1.s/e3.s) e3 ] (e3.s), for e3.s>0
+% (paper Eq.11; d_+ keeps only the LIT, propagating directions per source)
+% Structured directions: Gauss-Legendre in cos(theta), uniform in phi.
+% =========================================================================
+t1 = tic;
+[xg, wth] = gaussLegendre(nTheta); % nodes xg in cos(theta), weights wth
+theta = acos(xg(:)); % [nTheta x 1]
+phi = (0:nPhi-1).' * (2*pi/nPhi); % [nPhi x 1]
+st = sin(theta); ct = cos(theta);
+gamma = zeros(nTheta, nPhi); % e0 . e_theta
+beta = zeros(nTheta, nPhi); % e0 . e_phi
+% Loop over theta rows; vectorize over phi and over all sources (chunked). Kept
+% SERIAL on purpose: the per-row work is dominated by BLAS matrix products
+% (Sblk*O.', the coef*e1 reductions) which already multithread across all cores,
+% so a parfor here (single-threaded workers) would only give up that threading.
+chunk = max(1, floor(2e6 / max(Ns,1))); % keep ~2M complex per block
+for it = 1:nTheta
+sct = st(it); ctt = ct(it);
+grow = zeros(1, nPhi); brow = zeros(1, nPhi); % this theta-row's gamma,beta
+for p0 = 1:chunk:nPhi
+p1 = min(p0+chunk-1, nPhi);
+ph = phi(p0:p1).'; % [1 x c]
+% direction unit vectors s for this (theta, phi-block): [c x 3]
+sx = sct*cos(ph).'; sy = sct*sin(ph).'; sz = ctt*ones(numel(ph),1);
+Sblk = [sx, sy, sz]; % [c x 3]
+% spherical tangent basis at these directions
+eth = [ctt*cos(ph).', ctt*sin(ph).', -sct*ones(numel(ph),1)];
+eph = [-sin(ph).', cos(ph).', zeros(numel(ph),1)];
+% phase matrix exp(-i k s.o): [c x Ns]
+ksx = k*(Sblk*O.'); % s.o for each (dir, source)
+ph_mat = exp(-1i*ksx);
+% geometric projection factors per (dir, source)
+e1s = Sblk*e1.'; % e1.s [c x Ns]
+e3s = Sblk*e3.'; % e3.s [c x Ns]
+lit = e3s > 0; % d_+ (propagating / lit)
+proj = (e1s ./ e3s); proj(~lit) = 0; % e1.s/e3.s (0 where not lit)
+g3 = e3s; g3(~lit) = 0; % e3.s (0 where not lit)
+wrow = w.'; % [1 x Ns]
+% accumulate vector e0 = sum_o w (e1 - proj*e3) (e3.s) phase [c x 3]
+coef = (ph_mat .* g3) .* wrow; % [c x Ns]
+e0x = coef*e1(:,1) - (coef.*proj)*e3(:,1);
+e0y = coef*e1(:,2) - (coef.*proj)*e3(:,2);
+e0z = coef*e1(:,3) - (coef.*proj)*e3(:,3);
+e0 = [e0x, e0y, e0z]; % [c x 3]
+grow(p0:p1) = sum(e0.*eth, 2).';
+brow(p0:p1) = sum(e0.*eph, 2).';
+end
+gamma(it, :) = grow;
+beta (it, :) = brow;
+end
+if opt.verbose, fprintf('Stage1 (angular spectrum): %.2f s\n', toc(t1)); end
+% =========================================================================
+% STAGE 2 -- BSCs by FFT in phi + Gauss-Legendre in theta (paper Eq.14-15)
+% For each theta node we need the Fourier integrals over phi:
+% Sg(m) = int gamma sin(m phi) dphi , Cg(m) = int gamma cos(m phi) dphi
+% (and the same for beta). With uniform phi these are exact via the FFT:
+% int f cos(m phi) dphi = (2pi/nPhi) * Re( fft(f)_{m} )
+% int f sin(m phi) dphi = -(2pi/nPhi) * Im( fft(f)_{m} )
+% Then theta integration is a Gauss-Legendre sum (weights wth in cos theta).
+% =========================================================================
+t2 = tic;
+Gf = fft(gamma, [], 2); Bf = fft(beta, [], 2); % [nTheta x nPhi]
+cphi = (2*pi/nPhi);
+% gamma,beta are COMPLEX (the source field E0 is complex), so the Fourier cosine
+% and sine integrals must combine the +m and -m FFT bins:
+% int f cos(m phi) dphi = cphi/2 ( Gf(+m) + Gf(-m) )
+% int f sin(m phi) dphi = cphi/(2i)( Gf(-m) - Gf(+m) )
+% (the earlier real(Gf)/imag(Gf) form is valid ONLY for a real field and mixes
+% Re/Im of complex gamma -- that was the bug.)
+mm = 0:N; pos = mm + 1; neg = mod(nPhi - mm, nPhi) + 1; % +m and -m bins
+Cg = cphi*0.5*(Gf(:,pos) + Gf(:,neg)); Sg = cphi/(2i)*(Gf(:,neg) - Gf(:,pos));
+Cb = cphi*0.5*(Bf(:,pos) + Bf(:,neg)); Sb = cphi/(2i)*(Bf(:,neg) - Bf(:,pos));
+% normalized angular functions on the theta nodes: pi_bar = m P_bar/sin, tau_bar
+[PIE, TAO] = normLegendrePiTau(N, theta); % PIE,TAO are [nTheta x (n) x (m)]
+fac = (k/(2*pi))^2;
+% assemble linear index over (m=0..N-1, n=max(m,1)..N), matching the field eval
+[mIdx, nIdx] = modeList(N);
+Nc = numel(nIdx);
+Ate = zeros(Nc,1); Ato = zeros(Nc,1); Bte = zeros(Nc,1); Bto = zeros(Nc,1);
+for c = 1:Nc % kept serial (fast; ~0.5 s)
+m = mIdx(c); n = nIdx(c);
+pie = PIE(:, n+1, m+1); tao = TAO(:, n+1, m+1); % [nTheta x 1]
+sg = Sg(:,m+1); cg = Cg(:,m+1); sb = Sb(:,m+1); cb = Cb(:,m+1);
+% theta integral via Gauss-Legendre weights wth (already include sin theta)
+Ate(c) = -4*1i^n *fac* sum( wth .* ( m*pie.*sg + tao.*cb ) );
+Ato(c) = +4*1i^n *fac* sum( wth .* ( m*pie.*cg - tao.*sb ) );
+Bte(c) = -4*1i^(n+1) *fac* sum( wth .* ( tao.*cg - m*pie.*sb ) );
+Bto(c) = -4*1i^(n+1) *fac* sum( wth .* ( tao.*sg + m*pie.*cb ) );
+end
+if opt.verbose, fprintf('Stage2 (BSCs, SHT): %.2f s\n', toc(t2)); end
+% =========================================================================
+% STAGE 3-4 -- Mie sphere coefficients a_n,b_n (scattered) and c_n,d_n (internal)
+% =========================================================================
+[an, bn, cn, dn] = mieSphereCoeffs(k*a, mr, N); % [N x 1] (n=1..N)
+anC = an(nIdx); bnC = bn(nIdx); cnC = cn(nIdx); dnC = dn(nIdx);
+% scattered BSCs: M-modes get -b_n, N-modes get -a_n
+Fte = -Ate.*bnC; Fto = -Ato.*bnC; Gte = -Bte.*anC; Gto = -Bto.*anC;
+% internal BSCs: M-modes get c_n, N-modes get d_n
+Cte = Ate.*cnC; Cto = Ato.*cnC; Dte = Bte.*dnC; Dto = Bto.*dnC;
+out = struct('m',mIdx(:),'n',nIdx(:), 'Ate',Ate,'Ato',Ato,'Bte',Bte,'Bto',Bto, ...
+'Fte',Fte,'Fto',Fto,'Gte',Gte,'Gto',Gto, ...
+'Cte',Cte,'Cto',Cto,'Dte',Dte,'Dto',Dto, 'an',an,'bn',bn,'cn',cn,'dn',dn);
+% =========================================================================
+% STAGE 5 -- fields at evaluation points (paper Eq.16, normalized D_bar)
+% D_bar(m,n) = (2 - delta_{m0}) / (4 n (n+1)) (NO factorials)
+% Outside (r>a): E = Einc(j_n, A/B) + Escat(h_n, F/G)
+% Inside (r<a): E = Eint (j_n(mr*), C/D)
+% =========================================================================
+if isfield(opt,'Reval') && ~isempty(opt.Reval)
+t5 = tic;
+R = opt.Reval; P = size(R,1);
+% ---- Mie truncation orders (CRITICAL for numerical stability) ----------
+% The scattered field sums F_n * h_n(kr) over modes. Past the Wiscombe
+% order the TRUE a_n,b_n have already decayed below the roundoff floor
+% (~1e-16), while h_n(kr) grows super-exponentially for n>kr (e.g.
+% h_100(ka)~1e58 here). Their product is pure numerical garbage (~1e43) that
+% swamps the physical field near the sphere. So cap the SCATTERED sum at the
+% standard Mie order nS (Wiscombe: x+4x^(1/3)+2), where a_n,b_n are still
+% meaningful. The INTERNAL sum uses j_n(mr*kr) (bounded, cannot overflow) but
+% is capped at nI = order for mx for the same roundoff reason. The INCIDENT
+% sum keeps all N modes: j_n is bounded and the beam BSCs are physical to N.
+xa = k*a; mxa = abs(mr)*xa;
+nS = min(N, ceil(xa + 4*xa^(1/3) + 2)); % scattered (h_n) cutoff
+nI = min(N, ceil(mxa + 4*mxa^(1/3) + 2)); % internal (j_n(mr*)) cutoff
+% Evaluate points in CHUNKS, fully vectorized within each chunk. Chunks are
+% INDEPENDENT -> parfor over them, with per-chunk cell outputs (clean
+% slicing, no sliced-assignment ambiguity). Chunk size is bounded by memory
+% (~chunkSize*(N+1)^2 per chunk); when parallel we make enough chunks
+% (>= ~3 per worker) to balance the load and shrink each worker's footprint.
+if maxW > 0
+chunkSize = max(1, floor(2e7 / ((N+1)^2))); % smaller per-worker memory
+nCh = max(ceil(P/chunkSize), min(P, 3*maxW)); % feed all workers
+else
+chunkSize = max(1, floor(4e7 / ((N+1)^2)));
+nCh = max(1, ceil(P/chunkSize));
+end
+nCh = min(nCh, max(1,P));
+edges = round(linspace(0, P, nCh+1)); % contiguous chunk bounds
+Einc_c = cell(nCh,1); Escat_c = cell(nCh,1); Eint_c = cell(nCh,1);
+parfor (jc = 1:nCh, maxW)
+idx = (edges(jc)+1 : edges(jc+1)).';
+nc = numel(idx);
+Ei = zeros(nc,3); Es = zeros(nc,3); Ev = zeros(nc,3);
+if nc > 0
+Rc = R(idx,:); rc = sqrt(sum(Rc.^2,2)); good = rc > 0;
+rsafe = rc; rsafe(~good) = 1; % avoid /0; masked out below
+th0 = acos( min(max(Rc(:,3)./rsafe, -1), 1) );
+ph0 = atan2(Rc(:,2), Rc(:,1)); s0 = sin(th0);
+[PIEc, TAOc] = normLegendrePiTau(N, th0); % [nc x (N+1) x (N+1)]
+io = find(good & (rc > a)); % outside points in chunk
+ii = find(good & (rc <= a)); % inside points in chunk
+if ~isempty(io)
+ro = k*rc(io); PIEo = PIEc(io,:,:); TAOo = TAOc(io,:,:);
+[jn,jp] = sphBesselVec(N, ro, 'j');
+[hn,hp] = sphBesselVec(N, ro, 'h');
+E1 = vshVec(out.Ate,out.Ato,out.Bte,out.Bto, mIdx,nIdx, jn,jp,ro, PIEo,TAOo, ph0(io),s0(io), N);
+E3 = vshVec(out.Fte,out.Fto,out.Gte,out.Gto, mIdx,nIdx, hn,hp,ro, PIEo,TAOo, ph0(io),s0(io), nS);
+Ei(io,:) = sph2cart_rows(E1, th0(io),ph0(io));
+Es(io,:) = sph2cart_rows(E3, th0(io),ph0(io));
+end
+if ~isempty(ii)
+ri = mr*k*rc(ii); PIEi = PIEc(ii,:,:); TAOi = TAOc(ii,:,:);
+[jz,jzp] = sphBesselVec(N, ri, 'j');
+E2 = vshVec(out.Cte,out.Cto,out.Dte,out.Dto, mIdx,nIdx, jz,jzp,ri, PIEi,TAOi, ph0(ii),s0(ii), nI);
+Ev(ii,:) = sph2cart_rows(E2, th0(ii),ph0(ii));
+end
+end
+Einc_c{jc} = Ei; Escat_c{jc} = Es; Eint_c{jc} = Ev;
+end
+Einc = cat(1, Einc_c{:}); % reassemble in original row order
+Escat = cat(1, Escat_c{:});
+Eint = cat(1, Eint_c{:});
+out.Einc = Einc; out.Escat = Escat; out.Eint = Eint;
+out.Etot = Einc + Escat + Eint; % Eint is 0 outside and inc/scat 0 inside
+if opt.verbose, fprintf('Stage5 (field eval, P=%d): %.2f s\n', P, toc(t5)); end
+end
+end % ===================== main function =====================
+% =========================================================================
+% LOCAL: VSH series at one point (spherical components Er,Et,Ep)
+% Uses the normalized angular functions PIE=pi_bar=m P_bar/sin, TAO=tau_bar,
+% D_bar=(2-delta_m0)/(4 n (n+1)); M/N component forms as in the OL code.
+% =========================================================================
+function Esph = vshVec(Ae,Ao,Be,Bo, mIdx,nIdx, zn,zp,rho, PIE,TAO, ph0,s0, nMax)
+% Vectorized VSH series over a CHUNK of points.
+% zn,zp : [c x (N+1)] PIE,TAO : [c x (N+1) x (N+1)] rho,ph0,s0 : [c x 1]
+% nMax : skip modes with n>nMax (Mie-order truncation; see Stage 5). This is
+% REQUIRED for the scattered field: h_n(kr) overflows for n>>kr while
+% the scattered coefficients have long since decayed to roundoff, so
+% the high-n product is garbage. Pass N to include all modes.
+% Returns spherical components Esph = [Er Et Ep], size [c x 3].
+c = numel(rho);
+Er = zeros(c,1); Et = zeros(c,1); Ep = zeros(c,1);
+for q = 1:numel(nIdx)
+m = mIdx(q); n = nIdx(q);
+if n > nMax, continue; end
+Db = (2 - (m==0)) / (4*n*(n+1));
+pie = PIE(:, n+1, m+1); tao = TAO(:, n+1, m+1); % [c x 1]
+jnn = zn(:, n+1); jpp = zp(:, n+1); % [c x 1]
+sm = sin(m*ph0); cm = cos(m*ph0); mpie = m*pie;
+MEt=-jnn.*sm.*mpie; MEp=-jnn.*cm.*tao;
+MOt= jnn.*cm.*mpie; MOp=-jnn.*sm.*tao;
+NEr= n*(n+1)*(jnn./rho).*cm.*pie.*s0; NEt= jpp.*cm.*tao; NEp=-jpp.*sm.*mpie;
+NOr= n*(n+1)*(jnn./rho).*sm.*pie.*s0; NOt= jpp.*sm.*tao; NOp= jpp.*cm.*mpie;
+Er = Er + Db*( Be(q)*NEr + Bo(q)*NOr );
+Et = Et + Db*( Ae(q)*MEt + Ao(q)*MOt + Be(q)*NEt + Bo(q)*NOt );
+Ep = Ep + Db*( Ae(q)*MEp + Ao(q)*MOp + Be(q)*NEp + Bo(q)*NOp );
+end
+Esph = [Er, Et, Ep];
+end
+function Ecart = sph2cart_rows(Esph, th, ph)
+% spherical (Er,Et,Ep) -> cartesian (Ex,Ey,Ez), per row. th,ph : [c x 1]
+st=sin(th); ct=cos(th); sp=sin(ph); cp=cos(ph);
+Er=Esph(:,1); Et=Esph(:,2); Ep=Esph(:,3);
+Ecart = [ st.*cp.*Er + ct.*cp.*Et - sp.*Ep, ...
+st.*sp.*Er + ct.*sp.*Et + cp.*Ep, ...
+ct.*Er - st.*Et ];
+end
+% =========================================================================
+% LOCAL: linear mode list (m = 0..N-1, n = max(m,1)..N), the OL ordering
+% =========================================================================
+function [mIdx,nIdx] = modeList(N)
+mIdx = []; nIdx = [];
+for m = 0:N-1
+inst = max(m,1);
+nn = (inst:N).';
+mIdx = [mIdx; m*ones(numel(nn),1)]; %#ok<AGROW>
+nIdx = [nIdx; nn]; %#ok<AGROW>
+end
+end
+% =========================================================================
+% LOCAL: fully-normalized associated Legendre angular functions
+% Returns PIE = pi_bar = m * Pbar_{n,m}/sin(theta) and TAO = tau_bar =
+% dPbar_{n,m}/dtheta, arrays of size [numel(theta) x (N+1) x (N+1)]
+% (3rd index is m+1). Holmes & Featherstone (2002) column recurrence +
+% the normalized derivative identity (m=0 special-cased). Stable to n,m~1e3.
+% Validated against scipy to ~1e-13 (ol_legendre_check.py).
+% =========================================================================
+function [PIE, TAO] = normLegendrePiTau(N, theta)
+% VECTORIZED over theta. Returns PIE(:,n+1,m+1)=Pbar_{n,m}/sin(theta) and
+% TAO(:,n+1,m+1)=dPbar_{n,m}/dtheta, size [numel(theta) x (N+1) x (N+1)].
+% (caller forms pi_bar = m*PIE). Holmes-Featherstone recurrence; stable to large
+% N and overflow-free. Validated vs scipy to ~1e-13 (ol_legendre_check.py).
+theta = theta(:); T = numel(theta);
+t = cos(theta); u = sin(theta); % [T x 1]
+P = zeros(T, N+1, N+1); dP = zeros(T, N+1, N+1);
+P(:,1,1) = 1.0; % P(:,n+1,m+1) = Pbar_{n,m}
+for m = 1:N % sectoral seed
+P(:,m+1,m+1) = sqrt((2*m+1)/(2*m)) .* u .* P(:,m,m);
+end
+for m = 0:N
+if m+1 <= N
+P(:,m+2,m+1) = sqrt(2*m+3) .* t .* P(:,m+1,m+1);
+end
+for n = m+2:N
+anm = sqrt((2*n-1)*(2*n+1)/((n-m)*(n+m)));
+bnm = sqrt((2*n+1)*(n+m-1)*(n-m-1)/((2*n-3)*(n-m)*(n+m)));
+P(:,n+1,m+1) = anm.*t.*P(:,n,m+1) - bnm.*P(:,n-1,m+1);
+end
+end
+for n = 1:N
+dP(:,n+1,1) = -sqrt(n*(n+1)) .* P(:,n+1,2); % m = 0 special case
+for m = 1:n
+cm = sqrt((n+m)*(n-m+1));
+cp = sqrt((n-m)*(n+m+1));
+if (m+1) <= n
+dP(:,n+1,m+1) = 0.5*( cm.*P(:,n+1,m) - cp.*P(:,n+1,m+2) );
+else
+dP(:,n+1,m+1) = 0.5* cm.*P(:,n+1,m);
+end
+end
+end
+PIE = P ./ reshape(u,[T,1,1]); % explicit 3-D broadcast of 1/sin
+TAO = dP;
+end
+% =========================================================================
+% LOCAL: spherical Bessel/Hankel and the Riccati derivative ratio
+% kind 'j' -> z_n = j_n (regular); 'h' -> z_n = h_n^(1) (radiating)
+% Returns zn(n+1) = z_n(rho) and zp(n+1) = [rho z_n]'/rho = z_{n-1} - n z_n/rho
+% j_n uses MATLAB's stable mixed recurrence via besselj of half-integer order.
+% =========================================================================
+function [zn, zp] = sphBesselVec(N, rho, kind)
+% Spherical Bessel/Hankel over a COLUMN of arguments rho [c x 1] (vectorized).
+% zn(:,n+1) = z_n(rho); zp(:,n+1) = [rho z_n]'/rho = z_{n-1} - (n/rho) z_n
+% kind 'j' -> j_n (regular); 'h' -> h_n^(1) (radiating). Returns [c x (N+1)].
+rho = rho(:); c = numel(rho); nn = 0:N;
+ORD = repmat(nn+0.5, c, 1); ORDm = repmat(nn-0.5, c, 1); RHO = repmat(rho, 1, N+1);
+sfac = sqrt(pi ./ (2*RHO));
+if strcmp(kind,'j')
+zall = besselj(ORD, RHO) .* sfac; % j_n
+zm1 = besselj(ORDm, RHO) .* sfac; % j_{n-1} (j_{-1}=cos/rho handled)
+else
+zall = (besselj(ORD,RHO) + 1i*bessely(ORD,RHO)) .* sfac; % h_n^(1)
+zm1 = (besselj(ORDm,RHO) + 1i*bessely(ORDm,RHO)) .* sfac;
+end
+zn = zall;
+zp = (RHO.*zm1 - nn.*zall) ./ RHO; % nn [1 x N+1] expands over [c x N+1]
+end
+% =========================================================================
+% LOCAL: Mie coefficients of a homogeneous sphere (Bohren & Huffman)
+% x = k a (size parameter), m = relative refractive index, N modes.
+% a_n,b_n scattered; c_n,d_n internal. D_n(mx) by downward recurrence.
+% Validated: energy conservation Qext=Qsca (lossless) and code T11=b_n,T33=-a_n.
+% =========================================================================
+function [an, bn, cn, dn] = mieSphereCoeffs(x, m, N)
+mx = m*x; n = (1:N).';
+% logarithmic derivative D_n(mx) by DOWNWARD recurrence (stable)
+nmx = ceil(max(N, abs(mx)) + 16);
+D = zeros(nmx+1,1);
+for i = nmx:-1:1
+D(i) = i/mx - 1/(D(i+1) + i/mx);
+end
+Dn = D(2:N+1); % D_n, n=1..N
+% Riccati-Bessel psi,xi at x by upward recurrence
+psi = zeros(N+1,1); chi = zeros(N+1,1);
+psi_m1 = cos(x); psi0 = sin(x); chi_m1 = -sin(x); chi0 = cos(x);
+psi(1) = psi0; chi(1) = chi0; pm1=psi_m1; p0=psi0; cm1=chi_m1; c0=chi0;
+for i = 1:N
+p1 = (2*i-1)/x*p0 - pm1; psi(i+1)=p1; pm1=p0; p0=p1;
+c1 = (2*i-1)/x*c0 - cm1; chi(i+1)=c1; cm1=c0; c0=c1;
+end
+psin = psi(2:N+1); psin1 = psi(1:N);
+xin = psi(2:N+1) - 1i*chi(2:N+1); xin1 = psi(1:N) - 1i*chi(1:N);
+an = ((Dn/m + n/x).*psin - psin1) ./ ((Dn/m + n/x).*xin - xin1);
+bn = ((Dn*m + n/x).*psin - psin1) ./ ((Dn*m + n/x).*xin - xin1);
+% internal coefficients c_n, d_n (Bohren & Huffman 4.52), psi/xi at x and mx.
+% Riccati-Bessel derivative: z_n'(arg) = z_{n-1}(arg) - (n/arg) z_n(arg).
+psimx = sphRiccati(mx, N); % psi_n(mx) = mx * j_n(mx)
+psimx1 = sphRiccatiM1(mx, N); % psi_{n-1}(mx)
+psi_px = psin1 - (n./x).*psin; % psi_n'(x)
+xi_px = xin1 - (n./x).*xin; % xi_n'(x)
+psi_pmx= psimx1 - (n./mx).*psimx; % psi_n'(mx)
+num = m*(psin.*xi_px - psi_px.*xin); % = m * Wronskian(psi,xi) = m*i
+cn = num ./ (psimx.*xi_px - m*psi_pmx.*xin);
+dn = num ./ (m*psimx.*xi_px - psi_pmx.*xin);
+end
+function psn = sphRiccati(arg, N) % psi_n(arg) = arg*j_n(arg), n=1..N
+nn=(1:N).'; psn = besselj(nn+0.5,arg).*sqrt(pi*arg/2);
+end
+function psn1 = sphRiccatiM1(arg, N) % psi_{n-1}(arg), n=1..N
+nn=(1:N).'; psn1 = besselj(nn-0.5,arg).*sqrt(pi*arg/2);
+end
+% =========================================================================
+% LOCAL: Gauss-Legendre nodes/weights on [-1,1] (Golub-Welsch via eig)
+% x are nodes in cos(theta); w integrate f(cos th) over cos th in [-1,1],
+% i.e. they already include the sin(theta) d theta measure.
+% =========================================================================
+function [x, w] = gaussLegendre(N)
+i = (1:N-1).';
+beta = i ./ sqrt(4*i.^2 - 1);
+Tm = diag(beta,1) + diag(beta,-1);
+[V, Dd] = eig(Tm);
+[x, idx] = sort(diag(Dd));
+w = 2 * (V(1, idx).^2).';
+end
